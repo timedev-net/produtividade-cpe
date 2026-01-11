@@ -24,9 +24,15 @@ interface ChartDataConfig {
 })
 export class AppComponent implements AfterViewInit, OnDestroy {
   title = 'processos-app';
+  paginaAtiva: 'dashboard' | 'analise' = 'dashboard';
   carregado = false;
   fileName = '';
   erroLeitura = '';
+  qlikFileName = '';
+  eolisFileName = '';
+  analiseErro = '';
+  resultadoAnaliseHeaders: string[] = [];
+  resultadoAnaliseRows: string[][] = [];
   totalProcessos = 0;
   servidores: string[] = [];
   meses: MonthKey[] = [];
@@ -41,6 +47,10 @@ export class AppComponent implements AfterViewInit, OnDestroy {
   @ViewChildren('monthChart') monthCharts?: QueryList<ElementRef<HTMLCanvasElement>>;
 
   private charts: Record<MonthKey, Chart> = {};
+  private qlikValores = new Set<string>();
+  private eolisValores = new Set<string>();
+  private eolisLinhas: string[][] = [];
+  private eolisHeaders: string[] = [];
   private readonly palette = [
     '#2563eb', '#10b981', '#f97316', '#8b5cf6', '#ef4444',
     '#0ea5e9', '#22c55e', '#f59e0b', '#a855f7', '#64748b',
@@ -53,6 +63,14 @@ export class AppComponent implements AfterViewInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.destruirGraficos();
+  }
+
+  get analisePronta(): boolean {
+    return this.qlikValores.size > 0 && this.eolisLinhas.length > 0 && this.eolisValores.size > 0;
+  }
+
+  abrirPagina(pagina: 'dashboard' | 'analise'): void {
+    this.paginaAtiva = pagina;
   }
 
   onFileSelected(event: Event): void {
@@ -79,6 +97,26 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       this.fileName = file.name;
     };
     reader.readAsArrayBuffer(file);
+  }
+
+  onQlikSelected(event: Event): void {
+    this.processarArquivoAnalise(event, 'qlik');
+  }
+
+  onEolisSelected(event: Event): void {
+    this.processarArquivoAnalise(event, 'eolis');
+  }
+
+  baixarResultadoAnalise(): void {
+    if (!this.resultadoAnaliseRows.length) {
+      return;
+    }
+
+    const dados = [this.resultadoAnaliseHeaders, ...this.resultadoAnaliseRows];
+    const sheet = XLSX.utils.aoa_to_sheet(dados);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, sheet, 'Resultado');
+    XLSX.writeFile(workbook, 'analise-paralisados.xlsx');
   }
 
   private tratarWorkbook(workbook: XLSX.WorkBook): void {
@@ -120,6 +158,171 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     this.montarEstruturas(registros);
     this.erroLeitura = '';
     this.carregado = true;
+  }
+
+  private processarArquivoAnalise(event: Event, origem: 'qlik' | 'eolis'): void {
+    const file = (event.target as HTMLInputElement).files?.[0];
+    if (!file) {
+      return;
+    }
+
+    if (!file.name.toLowerCase().endsWith('.xlsx')) {
+      this.analiseErro = 'Envie um arquivo .xlsx';
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const arrayBuffer = e.target?.result;
+      if (!arrayBuffer) {
+        this.analiseErro = 'Nao foi possivel ler o arquivo.';
+        return;
+      }
+
+      const workbook = XLSX.read(arrayBuffer as ArrayBuffer, { type: 'array' });
+      const linhas = this.extrairLinhas(workbook);
+      const { headers, dataRows } = this.prepararPlanilha(linhas);
+      const valores = this.extrairValoresColunaB(dataRows);
+
+      if (!dataRows.length) {
+        this.analiseErro = 'Nao ha dados na planilha.';
+        if (origem === 'qlik') {
+          this.qlikValores = new Set();
+          this.qlikFileName = '';
+        } else {
+          this.eolisValores = new Set();
+          this.eolisFileName = '';
+          this.eolisLinhas = [];
+          this.eolisHeaders = [];
+        }
+        this.resultadoAnaliseRows = [];
+        this.resultadoAnaliseHeaders = [];
+        return;
+      }
+
+      if (!valores.length) {
+        this.analiseErro = 'Nao ha dados na coluna B.';
+        if (origem === 'qlik') {
+          this.qlikValores = new Set();
+          this.qlikFileName = '';
+        } else {
+          this.eolisValores = new Set();
+          this.eolisFileName = '';
+          this.eolisLinhas = [];
+          this.eolisHeaders = [];
+        }
+        this.resultadoAnaliseRows = [];
+        this.resultadoAnaliseHeaders = [];
+        return;
+      }
+
+      if (origem === 'qlik') {
+        this.qlikValores = new Set(valores);
+        this.qlikFileName = file.name;
+      } else {
+        this.eolisValores = new Set(valores);
+        this.eolisFileName = file.name;
+        this.eolisLinhas = dataRows;
+        this.eolisHeaders = headers;
+      }
+
+      this.analiseErro = '';
+      this.atualizarAnalise();
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  private extrairLinhas(workbook: XLSX.WorkBook): string[][] {
+    if (!workbook.SheetNames.length) {
+      return [];
+    }
+
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json<any[]>(sheet, { header: 1, defval: '' });
+
+    return rows.map((row) => {
+      if (!Array.isArray(row)) {
+        return [];
+      }
+      return row.map((value) => this.normalizarCelula(value));
+    });
+  }
+
+  private prepararPlanilha(rows: string[][]): { headers: string[]; dataRows: string[][] } {
+    if (!rows.length || rows.length < 2) {
+      return { headers: [], dataRows: [] };
+    }
+
+    const headersRaw = rows[0] ?? [];
+    const dataRowsRaw = rows.slice(1);
+    const colCount = Math.max(headersRaw.length, ...dataRowsRaw.map((row) => row.length));
+
+    const headers = this.padLinha(headersRaw, colCount).map((value, index) =>
+      value.length > 0 ? value : this.nomearColuna(index)
+    );
+    const dataRows = dataRowsRaw.map((row) => this.padLinha(row, colCount));
+
+    return { headers, dataRows };
+  }
+
+  private extrairValoresColunaB(rows: string[][]): string[] {
+    return rows
+      .map((row) => row[1] ?? '')
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+  }
+
+  private atualizarAnalise(): void {
+    if (!this.analisePronta) {
+      this.resultadoAnaliseRows = [];
+      this.resultadoAnaliseHeaders = [];
+      return;
+    }
+
+    const vistos = new Set<string>();
+    const resultado: string[][] = [];
+
+    this.eolisLinhas.forEach((row) => {
+      const valorB = (row[1] ?? '').trim();
+      if (!valorB || this.qlikValores.has(valorB) || vistos.has(valorB)) {
+        return;
+      }
+      vistos.add(valorB);
+      resultado.push(row);
+    });
+
+    this.resultadoAnaliseHeaders = this.eolisHeaders;
+    this.resultadoAnaliseRows = resultado;
+  }
+
+  private normalizarCelula(value: any): string {
+    if (value === null || value === undefined) {
+      return '';
+    }
+    return String(value).trim();
+  }
+
+  private padLinha(row: string[], colCount: number): string[] {
+    const linha = row.slice(0, colCount);
+    while (linha.length < colCount) {
+      linha.push('');
+    }
+    return linha;
+  }
+
+  private nomearColuna(index: number): string {
+    return `Coluna ${this.indiceParaColuna(index)}`;
+  }
+
+  private indiceParaColuna(index: number): string {
+    let numero = index + 1;
+    let letras = '';
+    while (numero > 0) {
+      const resto = (numero - 1) % 26;
+      letras = String.fromCharCode(65 + resto) + letras;
+      numero = Math.floor((numero - 1) / 26);
+    }
+    return letras;
   }
 
   private montarEstruturas(registros: { servidor: string; processo: string; data: Date }[]): void {
